@@ -135,19 +135,19 @@ class ContrastiveLoss(nn.Module):
         negative_loss = (1 - target) * torch.clamp(self.margin - distances, min=0.0) ** 2
         return torch.mean(positive_loss + negative_loss)
 
-def build_classifier(model_name: str, freeze_backbone: bool = False) -> nn.Module:
+def build_classifier(model_name: str, num_classes: int = 2, freeze_backbone: bool = False) -> nn.Module:
     if model_name == "resnet18":
         model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         in_features = model.fc.in_features
-        model.fc = nn.Linear(in_features, 2)
+        model.fc = nn.Linear(in_features, num_classes)
     elif model_name == "resnet50":
         model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
         in_features = model.fc.in_features
-        model.fc = nn.Linear(in_features, 2)
+        model.fc = nn.Linear(in_features, num_classes)
     elif model_name == "mobilenet_v3_small":
         model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
         in_features = model.classifier[3].in_features
-        model.classifier[3] = nn.Linear(in_features, 2)
+        model.classifier[3] = nn.Linear(in_features, num_classes)
     else:
         raise ValueError(f"Unknown classifier model: {model_name}")
         
@@ -220,9 +220,9 @@ def collect_samples(root: Path) -> Tuple[List[Sample], List[Sample]]:
                 
     return in_dist_samples, ood_samples
 
-def split_indices(samples: List[Sample], test_size: float = 0.2, seed: int = 42):
+def split_indices(samples: List[Sample], test_size: float = 0.2, seed: int = 42, num_classes: int = 2):
     indices = np.arange(len(samples))
-    labels = np.array([s.target for s in samples])
+    labels = np.array([s.fine_grained_target if num_classes == 3 else s.target for s in samples])
     train_idx, test_idx = train_test_split(indices, test_size=test_size, stratify=labels, random_state=seed)
     return train_idx.tolist(), test_idx.tolist()
 
@@ -462,8 +462,24 @@ def evaluate_extended_ood(classifier, siamese, prototypes, in_dist_loader, ood_l
             
     return results
 
-def evaluate_localization(classifier, dataset: SonarDataset, device, model_name: str):
+def evaluate_localization(classifier, dataset: SonarDataset, device, model_name: str, num_classes: int):
     classifier.eval()
+    if num_classes == 3:
+        preds_left_right, true_left_right = [], []
+        with torch.no_grad():
+            for entry in dataset.entries:
+                if entry.target == 0: continue
+                is_object_a = (entry.original_label == "object_a")
+                image = transforms.Resize((224, 224))(Image.open(entry.path).convert("RGB"))
+                tensor = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(transforms.ToTensor()(image))
+                logits = classifier(tensor.unsqueeze(0).to(device))
+                pred = torch.argmax(logits, dim=1).item()
+                preds_left_right.append(pred == 1)
+                true_left_right.append(is_object_a)
+        if len(true_left_right) == 0: return 0.0
+        acc = accuracy_score(true_left_right, preds_left_right)
+        return max(acc, 1 - acc)
+
     layer = get_target_layer_for_gradcam(classifier, model_name)
     grad_cam = GradCAM(classifier, layer)
     preds_left_right, true_left_right = [], []
@@ -490,13 +506,14 @@ def main():
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--run-id", type=str, default="run")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-classes", type=int, default=2, choices=[2, 3])
     args = parser.parse_args()
     
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
     
     logging.basicConfig(
-        filename=os.path.join(args.log_dir, f"{args.run_id}_{args.model_name}_seed{args.seed}.log"),
+        filename=os.path.join(args.log_dir, f"{args.run_id}_{args.model_name}_{args.num_classes}class_seed{args.seed}.log"),
         level=logging.INFO,
         format='%(asctime)s %(levelname)s:%(message)s'
     )
@@ -504,16 +521,18 @@ def main():
     
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"Device: {device}, Model: {args.model_name}, Seed: {args.seed}")
+    logging.info(f"Device: {device}, Model: {args.model_name}, Seed: {args.seed}, Classes: {args.num_classes}")
     
     in_dist_samples, ood_samples = collect_samples(Path(args.data_dir))
     logging.info(f"In-dist samples: {len(in_dist_samples)}, OOD samples: {len(ood_samples)}")
     if not in_dist_samples: raise ValueError("No in-distribution samples found.")
     
-    train_idx, test_idx = split_indices(in_dist_samples, seed=args.seed)
-    train_entries = [Entry(in_dist_samples[i].path, in_dist_samples[i].original_label, in_dist_samples[i].target, in_dist_samples[i].fine_grained_target) for i in train_idx]
-    test_entries = [Entry(in_dist_samples[i].path, in_dist_samples[i].original_label, in_dist_samples[i].target, in_dist_samples[i].fine_grained_target) for i in test_idx]
-    ood_entries = [Entry(s.path, s.original_label, s.target, s.fine_grained_target) for s in ood_samples]
+    train_idx, test_idx = split_indices(in_dist_samples, seed=args.seed, num_classes=args.num_classes)
+    
+    TGT = lambda s: s.fine_grained_target if args.num_classes == 3 else s.target
+    train_entries = [Entry(in_dist_samples[i].path, in_dist_samples[i].original_label, TGT(in_dist_samples[i]), in_dist_samples[i].fine_grained_target) for i in train_idx]
+    test_entries = [Entry(in_dist_samples[i].path, in_dist_samples[i].original_label, TGT(in_dist_samples[i]), in_dist_samples[i].fine_grained_target) for i in test_idx]
+    ood_entries = [Entry(s.path, s.original_label, -1, s.fine_grained_target) for s in ood_samples]
     
     train_tf, eval_tf = make_transforms()
     classifier_train_ds = SonarDataset(train_entries, train_tf)
@@ -524,8 +543,8 @@ def main():
     test_loader = DataLoader(classifier_test_ds, batch_size=32, shuffle=False, num_workers=0)
     ood_loader = DataLoader(ood_ds, batch_size=32, shuffle=False, num_workers=0)
     
-    classifier = build_classifier(args.model_name)
-    logging.info("Training Binary Classifier with Spatial Loss...")
+    classifier = build_classifier(args.model_name, num_classes=args.num_classes)
+    logging.info("Training Binary Classifier with Spatial Loss..." if args.num_classes == 2 else "Training 3-Class Classifier with Spatial Loss...")
     classifier = train_classifier(classifier, train_loader, device, epochs=args.epochs, use_spatial_loss=not args.no_spatial_loss, model_name=args.model_name)
     
     class_acc = evaluate_classifier_accuracy(classifier, test_loader, device)
@@ -549,13 +568,14 @@ def main():
         logging.info(f"OOD Results - {method_name}: AUROC: {metrics['AUROC']:.4f}, AUPR: {metrics['AUPR']:.4f}, FPR95: {metrics['FPR95']:.4f}")
     
     logging.info("Evaluating Localization...")
-    loc_acc = evaluate_localization(classifier, classifier_test_ds, device, args.model_name)
+    loc_acc = evaluate_localization(classifier, classifier_test_ds, device, args.model_name, args.num_classes)
     logging.info(f"Left/Right Localization Accuracy: {loc_acc:.4f}")
     
     results = {
         "run_id": args.run_id,
         "seed": args.seed,
-        "model_name": args.model_name,
+        "model_name": f"{args.model_name} ({args.num_classes}-class)",
+        "num_classes": args.num_classes,
         "spatial_loss_enabled": not args.no_spatial_loss,
         "classification_accuracy": class_acc,
         "siamese_accuracy": siam_acc,
@@ -563,7 +583,7 @@ def main():
         "ood_metrics": ood_results,
     }
     
-    output_filename = os.path.join(args.results_dir, f"{args.run_id}_{args.model_name}_seed{args.seed}.json")
+    output_filename = os.path.join(args.results_dir, f"{args.run_id}_{args.model_name}_{args.num_classes}class_seed{args.seed}.json")
     with open(output_filename, "w") as f:
         json.dump(results, f, indent=4)
     logging.info(f"Saved results to {output_filename}")

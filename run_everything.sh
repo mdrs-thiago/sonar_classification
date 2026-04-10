@@ -28,24 +28,27 @@ echo "=========================================="
 mkdir -p "$LOG_DIR"
 mkdir -p "$RESULTS_DIR"
 
-for MODEL in "${MODELS[@]}"; do
-    for SEED in "${SEEDS[@]}"; do
-        RUN_ID="run_s${SEED}"
-        echo ">>> Running Model: $MODEL | Seed: $SEED | Epochs: $EPOCHS"
-        
-        # Call the experiment pipeline
-        python experiment_pipeline.py \
-            --data-dir "$DATA_DIR" \
-            --epochs "$EPOCHS" \
-            --model-name "$MODEL" \
-            --seed "$SEED" \
-            --log-dir "$LOG_DIR" \
-            --results-dir "$RESULTS_DIR" \
-            --run-id "$RUN_ID"
+for CLASSES in 2 3; do
+    for MODEL in "${MODELS[@]}"; do
+        for SEED in "${SEEDS[@]}"; do
+            RUN_ID="run_s${SEED}"
+            echo ">>> Running Classes: $CLASSES | Model: $MODEL | Seed: $SEED | Epochs: $EPOCHS"
             
-        if [ $? -ne 0 ]; then
-            echo -e "\033[0;33mWARNING: Run for Model $MODEL with Seed $SEED exited with a non-zero status.\033[0m"
-        fi
+            # Call the experiment pipeline
+            python experiment_pipeline.py \
+                --data-dir "$DATA_DIR" \
+                --epochs "$EPOCHS" \
+                --model-name "$MODEL" \
+                --num-classes "$CLASSES" \
+                --seed "$SEED" \
+                --log-dir "$LOG_DIR" \
+                --results-dir "$RESULTS_DIR" \
+                --run-id "$RUN_ID"
+            
+            if [ $? -ne 0 ]; then
+                echo -e "\033[0;33mWARNING: Run for Model $MODEL with Seed $SEED exited with a non-zero status.\033[0m"
+            fi
+        done
     done
 done
 
