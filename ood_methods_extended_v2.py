@@ -36,6 +36,7 @@ import torch.nn.functional as F
 
 from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.neighbors import NearestNeighbors
+from sklearn.mixture import GaussianMixture
 
 
 Batch = Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -344,6 +345,99 @@ class FeatureMahalanobis(OODMethod):
                         md = float(np.sqrt(d.T @ inv_cov @ d))
                         best = min(best, md)
                     batch_scores.append(best)
+                scores.append(torch.tensor(batch_scores))
+        return torch.cat(scores, dim=0)
+
+
+class FeaturePCA(OODMethod):
+    """OpenPCS style: PCA on penultimate features, score = reconstruction error."""
+    
+    def __init__(self, model: torch.nn.Module, n_components: float = 0.95):
+        super().__init__(model)
+        self.extractor = HeadExtractor(self.model)
+        self.n_components = n_components
+        self.pca: Optional[PCA] = None
+
+    def fit(self, loader: Iterable[Batch]):
+        device = next(self.model.parameters()).device
+        feats: List[np.ndarray] = []
+        with torch.no_grad():
+            for x, _ in _iter_inputs(loader):
+                x = _to_device(x, device)
+                h = self.extractor.forward(x).h.detach().cpu().numpy()
+                feats.append(h)
+        X = np.concatenate(feats, axis=0)
+        n_comp = int(self.n_components) if self.n_components > 1 else self.n_components
+        self.pca = PCA(n_components=n_comp)
+        self.pca.fit(X)
+
+    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+        if self.pca is None:
+            raise RuntimeError("FeaturePCA.fit must be called before scoring.")
+        device = next(self.model.parameters()).device
+        scores: List[torch.Tensor] = []
+        with torch.no_grad():
+            for x, _ in _iter_inputs(loader):
+                x = _to_device(x, device)
+                h = self.extractor.forward(x).h.detach().cpu().numpy()
+                h_proj = self.pca.transform(h)
+                h_rec = self.pca.inverse_transform(h_proj)
+                # Reconstruction error: higher means OOD.
+                resid = np.linalg.norm(h - h_rec, axis=1)
+                scores.append(torch.from_numpy(resid))
+        return torch.cat(scores, dim=0)
+
+
+class FeatureGMM(OODMethod):
+    """Class-conditional GMM (Gaussian Mixture Model) in penultimate feature space."""
+    
+    def __init__(self, model: torch.nn.Module, n_components: int = 2, covariance_type: str = 'full'):
+        super().__init__(model)
+        self.extractor = HeadExtractor(self.model)
+        self.n_components = n_components
+        self.covariance_type = covariance_type
+        self.class_gmms: Dict[int, GaussianMixture] = {}
+
+    def fit(self, loader: Iterable[Batch]):
+        device = next(self.model.parameters()).device
+        feats: List[np.ndarray] = []
+        labels: List[int] = []
+        with torch.no_grad():
+            for x, y in _iter_inputs(loader):
+                if y is None:
+                    raise RuntimeError("FeatureGMM.fit requires labels.")
+                x = _to_device(x, device)
+                h = self.extractor.forward(x).h.detach().cpu().numpy()
+                feats.append(h)
+                labels.extend(y.detach().cpu().reshape(-1).tolist())
+        X = np.concatenate(feats, axis=0)
+        y = np.array(labels)
+        self.class_gmms = {}
+        for c in np.unique(y):
+            Xc = X[y == c]
+            gmm = GaussianMixture(n_components=self.n_components, covariance_type=self.covariance_type, reg_covar=1e-5)
+            gmm.fit(Xc)
+            self.class_gmms[int(c)] = gmm
+
+    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+        if not self.class_gmms:
+            raise RuntimeError("FeatureGMM.fit must be called before scoring.")
+        device = next(self.model.parameters()).device
+        scores: List[torch.Tensor] = []
+        with torch.no_grad():
+            for x, _ in _iter_inputs(loader):
+                x = _to_device(x, device)
+                h = self.extractor.forward(x).h.detach().cpu().numpy()
+                batch_scores = []
+                for i in range(h.shape[0]):
+                    xi = h[i:i+1] # keep 2d shape (1, D)
+                    best_nll = np.inf
+                    for gmm in self.class_gmms.values():
+                        # score_samples gives log likelihoods, so negative log likelihood is an OOD metric (higher=OOD)
+                        ll = gmm.score_samples(xi)[0]
+                        nll = -ll
+                        best_nll = min(best_nll, nll)
+                    batch_scores.append(best_nll)
                 scores.append(torch.tensor(batch_scores))
         return torch.cat(scores, dim=0)
 

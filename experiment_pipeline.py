@@ -411,19 +411,33 @@ def evaluate_extended_ood(classifier, siamese, prototypes, in_dist_loader, ood_l
     results["SiameseCosine"] = compute_ood_metrics(all_labels, all_sim)
     results["SiameseEuclidean"] = compute_ood_metrics(all_labels, all_euc)
     
-    methods = {
-        "MSP": ood_ext.MSP(classifier),
-        "Energy": ood_ext.EnergyBased(classifier),
-        "Odin": ood_ext.Odin(classifier),
-        "FeatureKNN": ood_ext.FeatureKNN(classifier),
-        "FeatureMahalanobis": ood_ext.FeatureMahalanobis(classifier),
-        "GradNorm": ood_ext.GradNorm(classifier),
-        "GradOrth": ood_ext.GradOrth(classifier),
-        "LowDimGradResidual": ood_ext.LowDimGradResidual(classifier),
-        "GradVecMahalanobis": ood_ext.GradVecMahalanobis(classifier),
-        "TwoSidedHeadGradResidual": ood_ext.TwoSidedHeadGradResidual(classifier),
-        "TwoSidedHeadGradCodeMahalanobis": ood_ext.TwoSidedHeadGradCodeMahalanobis(classifier)
-    }
+    methods = {}
+    
+    # 1. Standard Logit Baselines (Tuning Temperature and Epsilon)
+    methods["MSP"] = ood_ext.MSP(classifier)
+    for T in [1.0, 10.0, 100.0]:
+        methods[f"Energy_T{int(T)}"] = ood_ext.EnergyBased(classifier, temperature=T)
+    for eps in [0.001, 0.005]:
+        for T in [1.0, 100.0]:
+            methods[f"Odin_T{int(T)}_eps{eps}"] = ood_ext.Odin(classifier, epsilon=eps, temperature=T)
+
+    # 2. Feature-Based Baselines (Tuning K, Components, Clusters)
+    methods["FeatureMahalanobis"] = ood_ext.FeatureMahalanobis(classifier)
+    for k in [2, 5, 20]:
+        methods[f"FeatureKNN_k{k}"] = ood_ext.FeatureKNN(classifier, k=k)
+    for comp in [0.95, 0.99]:
+        methods[f"FeaturePCA_comp{comp}"] = ood_ext.FeaturePCA(classifier, n_components=comp)
+    for gmm_k in [1, 2, 3]:
+        methods[f"FeatureGMM_comp{gmm_k}"] = ood_ext.FeatureGMM(classifier, n_components=gmm_k)
+
+    # 3. Gradient Baselines (Tuning Softmax Temperature to prevent vanishing CE gradients on confident ID predictions)
+    for T in [1.0, 10.0, 100.0]:
+        methods[f"GradNorm_T{int(T)}"] = ood_ext.GradNorm(classifier, temperature=T)
+        methods[f"GradOrth_T{int(T)}"] = ood_ext.GradOrth(classifier, temperature=T)
+        methods[f"LowDimGradResidual_T{int(T)}"] = ood_ext.LowDimGradResidual(classifier, temperature=T)
+        methods[f"GradVecMahalanobis_T{int(T)}"] = ood_ext.GradVecMahalanobis(classifier, temperature=T)
+        methods[f"TwoSidedHeadGradResidual_T{int(T)}"] = ood_ext.TwoSidedHeadGradResidual(classifier, temperature=T)
+        methods[f"TwoSidedHeadGradCodeMaha_T{int(T)}"] = ood_ext.TwoSidedHeadGradCodeMahalanobis(classifier, temperature=T)
 
     logging.info("Fitting OOD methods...")
     for name, method in methods.items():
