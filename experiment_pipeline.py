@@ -430,14 +430,19 @@ def evaluate_extended_ood(classifier, siamese, prototypes, in_dist_loader, ood_l
     for gmm_k in [1, 2, 3]:
         methods[f"FeatureGMM_comp{gmm_k}"] = ood_ext.FeatureGMM(classifier, n_components=gmm_k)
 
-    # 3. Gradient Baselines (Tuning Softmax Temperature to prevent vanishing CE gradients on confident ID predictions)
+    # 3. Gradient Baselines (Tuning Softmax Temperature and Divergence Topology)
     for T in [1.0, 10.0, 100.0]:
-        methods[f"GradNorm_T{int(T)}"] = ood_ext.GradNorm(classifier, temperature=T)
-        methods[f"GradOrth_T{int(T)}"] = ood_ext.GradOrth(classifier, temperature=T)
-        methods[f"LowDimGradResidual_T{int(T)}"] = ood_ext.LowDimGradResidual(classifier, temperature=T)
-        methods[f"GradVecMahalanobis_T{int(T)}"] = ood_ext.GradVecMahalanobis(classifier, temperature=T)
-        methods[f"TwoSidedHeadGradResidual_T{int(T)}"] = ood_ext.TwoSidedHeadGradResidual(classifier, temperature=T)
-        methods[f"TwoSidedHeadGradCodeMaha_T{int(T)}"] = ood_ext.TwoSidedHeadGradCodeMahalanobis(classifier, temperature=T)
+        for l_type in ["uniform_kl", "entropy"]:
+            l_tag = "uni" if l_type == "uniform_kl" else "ent"
+            tag = f"T{int(T)}_{l_tag}"
+            
+            methods[f"GradNorm_{tag}"] = ood_ext.GradNorm(classifier, temperature=T, loss_type=l_type)
+            methods[f"GradOrth_{tag}"] = ood_ext.GradOrth(classifier, temperature=T, loss_type=l_type)
+            methods[f"LowDimGradResidual_{tag}"] = ood_ext.LowDimGradResidual(classifier, temperature=T, loss_type=l_type)
+            methods[f"GradVecMahalanobis_{tag}"] = ood_ext.GradVecMahalanobis(classifier, temperature=T, loss_type=l_type)
+            methods[f"GradVecGMM_{tag}"] = ood_ext.GradVecGMM(classifier, temperature=T, loss_type=l_type, gmm_components=2)
+            methods[f"TwoSidedHeadGradResidual_{tag}"] = ood_ext.TwoSidedHeadGradResidual(classifier, temperature=T, loss_type=l_type)
+            methods[f"TwoSidedHeadGradCodeMaha_{tag}"] = ood_ext.TwoSidedHeadGradCodeMahalanobis(classifier, temperature=T, loss_type=l_type)
 
     logging.info("Fitting OOD methods...")
     for name, method in methods.items():

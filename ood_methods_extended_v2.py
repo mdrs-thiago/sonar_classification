@@ -562,38 +562,29 @@ class LowDimGradResidual(OODMethod):
         temperature: float = 1.0,
         n_components: float = 0.95,
         max_components: int = 256,
-        pca_batch_size: int = 512,
     ):
         super().__init__(model)
         self.loss_type = loss_type
         self.temperature = temperature
         self.n_components = n_components
         self.max_components = max_components
-        self.pca_batch_size = pca_batch_size
         self.extractor = HeadExtractor(self.model)
         self.pca: Optional[PCA] = None
         self.mean_: Optional[np.ndarray] = None
 
     def fit(self, loader: Iterable[Batch]):
         device = next(self.model.parameters()).device
-        total = 0
-        sum_vec: Optional[np.ndarray] = None
-        n_features = None
+        vecs: List[np.ndarray] = []
         for x, _ in _iter_inputs(loader):
             x = _to_device(x, device)
             head_io = self.extractor.forward(x)
             G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            v = G.flatten(1).detach().cpu().numpy()
-            if sum_vec is None:
-                n_features = v.shape[1]
-                sum_vec = v.sum(axis=0, dtype=np.float64)
-            else:
-                sum_vec += v.sum(axis=0, dtype=np.float64)
-            total += v.shape[0]
-        if sum_vec is None or n_features is None or total == 0:
-            raise RuntimeError("LowDimGradResidual.fit received no samples.")
-        self.mean_ = (sum_vec / total).astype(np.float32, copy=False)[None, :]
+            vecs.append(G.flatten(1).detach().cpu().numpy())
+        X = np.concatenate(vecs, axis=0)
+        self.mean_ = X.mean(axis=0, keepdims=True)
+        Xc = X - self.mean_
 
+        total, n_features = X.shape
         max_k = min(total, n_features)
         if isinstance(self.n_components, float):
             n_comp = max(1, int(max_k * self.n_components))
@@ -601,14 +592,8 @@ class LowDimGradResidual(OODMethod):
             n_comp = int(self.n_components)
         n_comp = max(1, min(max_k, self.max_components, n_comp))
 
-        self.pca = IncrementalPCA(n_components=n_comp, batch_size=self.pca_batch_size)
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            v = G.flatten(1).detach().cpu().numpy()
-            Xc = v - self.mean_
-            self.pca.partial_fit(Xc)
+        self.pca = PCA(n_components=n_comp)
+        self.pca.fit(Xc)
 
     def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
         if self.pca is None or self.mean_ is None:
@@ -639,7 +624,6 @@ class GradVecMahalanobis(OODMethod):
         n_components: float = 0.95,
         shrinkage: float = 1e-6,
         max_components: int = 256,
-        pca_batch_size: int = 512,
     ):
         super().__init__(model)
         self.loss_type = loss_type
@@ -647,7 +631,6 @@ class GradVecMahalanobis(OODMethod):
         self.n_components = n_components
         self.shrinkage = shrinkage
         self.max_components = max_components
-        self.pca_batch_size = pca_batch_size
         self.extractor = HeadExtractor(self.model)
         self.pca: Optional[PCA] = None
         self.mean_: Optional[np.ndarray] = None
@@ -655,26 +638,23 @@ class GradVecMahalanobis(OODMethod):
 
     def fit(self, loader: Iterable[Batch]):
         device = next(self.model.parameters()).device
-        total = 0
-        sum_vec: Optional[np.ndarray] = None
-        n_features = None
+        vecs: List[np.ndarray] = []
+        labels: List[int] = []
         for x, y in _iter_inputs(loader):
             if y is None:
                 raise RuntimeError("GradVecMahalanobis.fit requires labels.")
             x = _to_device(x, device)
             head_io = self.extractor.forward(x)
             G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            v = G.flatten(1).detach().cpu().numpy()
-            if sum_vec is None:
-                n_features = v.shape[1]
-                sum_vec = v.sum(axis=0, dtype=np.float64)
-            else:
-                sum_vec += v.sum(axis=0, dtype=np.float64)
-            total += v.shape[0]
-        if sum_vec is None or n_features is None or total == 0:
-            raise RuntimeError("GradVecMahalanobis.fit received no samples.")
-        self.mean_ = (sum_vec / total).astype(np.float32, copy=False)[None, :]
+            vecs.append(G.flatten(1).detach().cpu().numpy())
+            labels.extend(y.detach().cpu().reshape(-1).tolist())
+            
+        X = np.concatenate(vecs, axis=0)
+        y = np.array(labels)
+        self.mean_ = X.mean(axis=0, keepdims=True)
+        Xc = X - self.mean_
 
+        total, n_features = X.shape
         max_k = min(total, n_features)
         if isinstance(self.n_components, float):
             n_comp = max(1, int(max_k * self.n_components))
@@ -682,29 +662,9 @@ class GradVecMahalanobis(OODMethod):
             n_comp = int(self.n_components)
         n_comp = max(1, min(max_k, self.max_components, n_comp))
 
-        self.pca = IncrementalPCA(n_components=n_comp, batch_size=self.pca_batch_size)
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            v = G.flatten(1).detach().cpu().numpy()
-            Xc = v - self.mean_
-            self.pca.partial_fit(Xc)
-
-        labels: List[int] = []
-        Xr_chunks: List[np.ndarray] = []
-        for x, y in _iter_inputs(loader):
-            if y is None:
-                raise RuntimeError("GradVecMahalanobis.fit requires labels.")
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            v = G.flatten(1).detach().cpu().numpy()
-            Xc = v - self.mean_
-            Xr_chunks.append(self.pca.transform(Xc))
-            labels.extend(y.detach().cpu().reshape(-1).tolist())
-        Xr = np.concatenate(Xr_chunks, axis=0)
-        y = np.array(labels)
+        self.pca = PCA(n_components=n_comp)
+        Xr = self.pca.fit_transform(Xc)
+        
         self.class_stats = {}
         for c in np.unique(y):
             Xc_c = Xr[y == c]
@@ -733,6 +693,92 @@ class GradVecMahalanobis(OODMethod):
                     md = float(np.sqrt(d.T @ inv_cov @ d))
                     best = min(best, md)
                 batch_scores.append(best)
+            scores.append(torch.tensor(batch_scores))
+        return torch.cat(scores, dim=0)
+
+
+class GradVecGMM(OODMethod):
+    """GradVec-like baseline: use per-sample vec(head-gradient) -> PCA -> class-conditional GMM."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        loss_type: str = "uniform_kl",
+        temperature: float = 1.0,
+        n_components: float = 0.95,
+        gmm_components: int = 2,
+        covariance_type: str = 'full',
+        max_components: int = 256,
+    ):
+        super().__init__(model)
+        self.loss_type = loss_type
+        self.temperature = temperature
+        self.n_components = n_components
+        self.gmm_components = gmm_components
+        self.covariance_type = covariance_type
+        self.max_components = max_components
+        self.extractor = HeadExtractor(self.model)
+        self.pca: Optional[PCA] = None
+        self.mean_: Optional[np.ndarray] = None
+        self.class_gmms: Dict[int, GaussianMixture] = {}
+
+    def fit(self, loader: Iterable[Batch]):
+        device = next(self.model.parameters()).device
+        vecs: List[np.ndarray] = []
+        labels: List[int] = []
+        for x, y in _iter_inputs(loader):
+            if y is None:
+                raise RuntimeError("GradVecGMM.fit requires labels.")
+            x = _to_device(x, device)
+            head_io = self.extractor.forward(x)
+            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
+            vecs.append(G.flatten(1).detach().cpu().numpy())
+            labels.extend(y.detach().cpu().reshape(-1).tolist())
+            
+        X = np.concatenate(vecs, axis=0)
+        y = np.array(labels)
+        self.mean_ = X.mean(axis=0, keepdims=True)
+        Xc = X - self.mean_
+
+        total, n_features = X.shape
+        max_k = min(total, n_features)
+        if isinstance(self.n_components, float):
+            n_comp = max(1, int(max_k * self.n_components))
+        else:
+            n_comp = int(self.n_components)
+        n_comp = max(1, min(max_k, self.max_components, n_comp))
+
+        self.pca = PCA(n_components=n_comp)
+        Xr = self.pca.fit_transform(Xc)
+        
+        self.class_gmms = {}
+        for c in np.unique(y):
+            Xc_c = Xr[y == c]
+            gmm = GaussianMixture(n_components=self.gmm_components, covariance_type=self.covariance_type, reg_covar=1e-5)
+            gmm.fit(Xc_c)
+            self.class_gmms[int(c)] = gmm
+
+    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+        if self.pca is None or self.mean_ is None or not self.class_gmms:
+            raise RuntimeError("GradVecGMM.fit must be called before scoring.")
+        device = next(self.model.parameters()).device
+        scores: List[torch.Tensor] = []
+        for x, _ in _iter_inputs(loader):
+            x = _to_device(x, device)
+            head_io = self.extractor.forward(x)
+            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
+            X = G.flatten(1).detach().cpu().numpy()
+            Xc = X - self.mean_
+            Z = self.pca.transform(Xc)
+            batch_scores = []
+            for i in range(Z.shape[0]):
+                zi = Z[i:i+1]
+                best_nll = np.inf
+                for gmm in self.class_gmms.values():
+                    ll = gmm.score_samples(zi)[0]
+                    nll = -ll
+                    best_nll = min(best_nll, nll)
+                batch_scores.append(best_nll)
             scores.append(torch.tensor(batch_scores))
         return torch.cat(scores, dim=0)
 
