@@ -2,7 +2,7 @@
 
 # Default arguments
 EPOCHS=15
-MODELS=("resnet18" "resnet50" "mobilenet_v3_small")
+MODELS=("resnet18" "resnet50" "mobilenet_v3_small" "convnext_tiny" "efficientnet_v2_s" "vit_b_16")
 SEEDS=(42 43 44)
 DATA_DIR="datasets"
 LOG_DIR="logs"

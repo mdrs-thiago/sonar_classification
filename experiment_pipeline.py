@@ -111,6 +111,19 @@ class EmbeddingNet(nn.Module):
             backbone = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
             self.backbone = nn.Sequential(backbone.features, nn.AdaptiveAvgPool2d(1))
             in_features = backbone.classifier[0].in_features
+        elif model_name == "convnext_tiny":
+            backbone = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.DEFAULT)
+            self.backbone = nn.Sequential(backbone.features, backbone.avgpool)
+            in_features = backbone.classifier[2].in_features
+        elif model_name == "efficientnet_v2_s":
+            backbone = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.DEFAULT)
+            self.backbone = nn.Sequential(backbone.features, backbone.avgpool, nn.Flatten())
+            in_features = backbone.classifier[1].in_features
+        elif model_name == "vit_b_16":
+            backbone = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT)
+            in_features = backbone.heads.head.in_features
+            backbone.heads.head = nn.Identity()
+            self.backbone = backbone
         else:
             raise ValueError(f"Unknown Siamese model: {model_name}")
 
@@ -148,6 +161,18 @@ def build_classifier(model_name: str, num_classes: int = 2, freeze_backbone: boo
         model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
         in_features = model.classifier[3].in_features
         model.classifier[3] = nn.Linear(in_features, num_classes)
+    elif model_name == "convnext_tiny":
+        model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.DEFAULT)
+        in_features = model.classifier[2].in_features
+        model.classifier[2] = nn.Linear(in_features, num_classes)
+    elif model_name == "efficientnet_v2_s":
+        model = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.DEFAULT)
+        in_features = model.classifier[1].in_features
+        model.classifier[1] = nn.Linear(in_features, num_classes)
+    elif model_name == "vit_b_16":
+        model = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT)
+        in_features = model.heads.head.in_features
+        model.heads.head = nn.Linear(in_features, num_classes)
     else:
         raise ValueError(f"Unknown classifier model: {model_name}")
         
@@ -162,6 +187,12 @@ def get_target_layer_for_gradcam(model, model_name: str):
         return model.layer4
     elif "mobilenet" in model_name:
         return model.features[-1]
+    elif "convnext" in model_name:
+        return model.features[-1][-1]
+    elif "efficientnet" in model_name:
+        return model.features[-1]
+    elif "vit" in model_name:
+        return None
     return list(model.children())[-2]
 
 class SpatialAttentionLoss:
@@ -246,7 +277,9 @@ def train_classifier(model, train_loader, device, epochs=10, lr=3e-4, use_spatia
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
     target_layer = get_target_layer_for_gradcam(model, model_name)
-    att_loss_fn = SpatialAttentionLoss(target_layer) if use_spatial_loss else None
+    if "vit" in model_name:
+        use_spatial_loss = False
+    att_loss_fn = SpatialAttentionLoss(target_layer) if use_spatial_loss and target_layer is not None else None
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
@@ -485,6 +518,10 @@ def evaluate_localization(classifier, dataset: SonarDataset, device, model_name:
         acc = accuracy_score(true_left_right, preds_left_right)
         return max(acc, 1 - acc)
 
+    if "vit" in model_name:
+        logging.warning("Grad-CAM localization omitted for ViT because it lacks 4D native spatial maps.")
+        return 0.0
+
     layer = get_target_layer_for_gradcam(classifier, model_name)
     grad_cam = GradCAM(classifier, layer)
     preds_left_right, true_left_right = [], []
@@ -505,7 +542,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, default="datasets")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--model-name", type=str, default="resnet18", choices=["resnet18", "resnet50", "mobilenet_v3_small"])
+    parser.add_argument("--model-name", type=str, default="resnet18", choices=["resnet18", "resnet50", "mobilenet_v3_small", "convnext_tiny", "efficientnet_v2_s", "vit_b_16"])
     parser.add_argument("--no-spatial-loss", action="store_true")
     parser.add_argument("--log-dir", type=str, default="logs")
     parser.add_argument("--results-dir", type=str, default="results")
